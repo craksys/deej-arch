@@ -3,10 +3,14 @@ package deej
 import (
 	"fmt"
 	"net"
+	"regexp"
 
 	"github.com/jfreymuth/pulse/proto"
 	"go.uber.org/zap"
 )
+
+// Regex to extract app name from PipeWire ALSA format: "PipeWire ALSA [appname]"
+var pipewireAppNameRegex = regexp.MustCompile(`\[([^\]]+)\]$`)
 
 type paSessionFinder struct {
 	logger        *zap.SugaredLogger
@@ -129,17 +133,31 @@ func (sf *paSessionFinder) enumerateAndAddSessions(sessions *[]Session) error {
 	}
 
 	for _, info := range reply {
-		name, ok := info.Properties["application.process.binary"]
+		var name string
 
-		if !ok {
+		// Priority 1: application.process.binary (cleanest name)
+		if binaryName, ok := info.Properties["application.process.binary"]; ok {
+			name = binaryName.String()
+		} else if appName, ok := info.Properties["application.name"]; ok {
+			// Priority 2: application.name, but try to extract from PipeWire format
+			nameStr := appName.String()
+			// Check if it matches PipeWire ALSA format like "PipeWire ALSA [firefox]"
+			if matches := pipewireAppNameRegex.FindStringSubmatch(nameStr); len(matches) > 1 {
+				name = matches[1]
+			} else {
+				name = nameStr
+			}
+		} else if mediaName, ok := info.Properties["media.name"]; ok {
+			// Priority 3: media.name as last resort
+			name = mediaName.String()
+		} else {
 			sf.logger.Warnw("Failed to get sink input's process name",
 				"sinkInputIndex", info.SinkInputIndex)
-
 			continue
 		}
 
 		// create the deej session object
-		newSession := newPASession(sf.sessionLogger, sf.client, info.SinkInputIndex, info.Channels, name.String())
+		newSession := newPASession(sf.sessionLogger, sf.client, info.SinkInputIndex, info.Channels, name)
 
 		// add it to our slice
 		*sessions = append(*sessions, newSession)
