@@ -32,6 +32,10 @@ type SerialIO struct {
 	lastKnownNumSliders        int
 	currentSliderPercentValues []float32
 
+	// debouncing for slider count changes to prevent noise-induced resets
+	pendingNumSliders           int
+	consecutiveSliderCountReads int
+
 	sliderMoveConsumers []chan SliderMoveEvent
 }
 
@@ -242,31 +246,56 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 	splitLine := strings.Split(line, "|")
 	numSliders := len(splitLine)
 
-	// update our slider count, if needed - this will send slider move events for all
-	if numSliders != sio.lastKnownNumSliders {
-		logger.Infow("Detected sliders", "amount", numSliders)
-		sio.lastKnownNumSliders = numSliders
-		sio.currentSliderPercentValues = make([]float32, numSliders)
+	// debounce slider count changes to prevent noise-induced resets
+	// require multiple consecutive readings with the same count before accepting
+	const requiredConsecutiveReads = 3
 
-		// reset everything to be an impossible value to force the slider move event later
-		for idx := range sio.currentSliderPercentValues {
-			sio.currentSliderPercentValues[idx] = -1.0
+	if numSliders != sio.lastKnownNumSliders {
+		// check if this is the same pending count we've been seeing
+		if numSliders == sio.pendingNumSliders {
+			sio.consecutiveSliderCountReads++
+		} else {
+			// new potential slider count, start tracking it
+			sio.pendingNumSliders = numSliders
+			sio.consecutiveSliderCountReads = 1
 		}
+
+		// only accept the change after enough consistent readings
+		if sio.consecutiveSliderCountReads >= requiredConsecutiveReads {
+			logger.Infow("Detected sliders", "amount", numSliders)
+			sio.lastKnownNumSliders = numSliders
+			sio.currentSliderPercentValues = make([]float32, numSliders)
+
+			// reset everything to be an impossible value to force the slider move event later
+			for idx := range sio.currentSliderPercentValues {
+				sio.currentSliderPercentValues[idx] = -1.0
+			}
+
+			// reset debounce tracking
+			sio.consecutiveSliderCountReads = 0
+		} else {
+			// not enough consistent readings yet, ignore this line
+			return
+		}
+	}
+
+	// convert all values first and validate them
+	sliderValues := make([]int, numSliders)
+	for sliderIdx, stringValue := range splitLine {
+		number, _ := strconv.Atoi(stringValue)
+
+		// validate that ALL values are within valid range (0-1023)
+		// serial noise can corrupt any position, not just the first
+		if number < 0 || number > 1023 {
+			sio.logger.Debugw("Got malformed line from serial, ignoring", "line", line)
+			return
+		}
+		sliderValues[sliderIdx] = number
 	}
 
 	// for each slider:
 	moveEvents := []SliderMoveEvent{}
-	for sliderIdx, stringValue := range splitLine {
-
-		// convert string values to integers ("1023" -> 1023)
-		number, _ := strconv.Atoi(stringValue)
-
-		// turns out the first line could come out dirty sometimes (i.e. "4558|925|41|643|220")
-		// so let's check the first number for correctness just in case
-		if sliderIdx == 0 && number > 1023 {
-			sio.logger.Debugw("Got malformed line from serial, ignoring", "line", line)
-			return
-		}
+	for sliderIdx, number := range sliderValues {
 
 		// map the value from raw to a "dirty" float between 0 and 1 (e.g. 0.15451...)
 		dirtyFloat := float32(number) / 1023.0
